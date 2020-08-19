@@ -26,6 +26,29 @@ pub mod account;
 pub mod backend;
 pub mod state;
 
+use ethereum_types::{Address, H256};
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum Target {
+	Account(Address),
+	Code(Address, H256),
+	Storage(Address, H256),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum AccessMode {
+	Create,
+	Read,
+	Update,
+	Delete
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Access {
+	target: Target,
+	mode: AccessMode,
+}
+
 pub use {
 	account::Account,
 	backend::Backend,

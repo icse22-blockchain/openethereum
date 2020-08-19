@@ -207,6 +207,7 @@ impl<B: Backend> ExecutiveState for State<B> {
 				(env_info.number >= params.eip98_transition && env_info.number >= params.validate_receipts_transition);
 
 		let outcome = if no_intermediate_commits {
+			self.commit()?;
 			if eip658 {
 				TransactionOutcome::StatusCode(if e.exception.is_some() { 0 } else { 1 })
 			} else {

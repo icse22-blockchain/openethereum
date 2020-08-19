@@ -29,6 +29,8 @@ use std::{
 	fmt,
 };
 
+use parking_lot::Mutex;
+
 use common_types::{
 	state_diff::StateDiff,
 	basic_account::BasicAccount,
@@ -49,6 +51,7 @@ use trie_db::{Trie, TrieError, Recorder};
 use crate::{
 	account::Account,
 	backend::Backend,
+	Target, AccessMode, Access,
 };
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
@@ -208,6 +211,14 @@ pub struct State<B> {
 	checkpoints: RefCell<Vec<HashMap<Address, Option<AccountEntry>>>>,
 	account_start_nonce: U256,
 	factories: Factories,
+
+	// track CRUD access to accounts, code, and storage
+	// reads are populated on each db/cache access
+	// writes are populated during commit
+	accesses: Arc<Mutex<HashSet<Access>>>,
+
+	// track newly created accounts
+	new_accounts: Mutex<HashSet<Address>>,
 }
 
 #[derive(Copy, Clone)]
@@ -254,6 +265,15 @@ const SEC_TRIE_DB_UNWRAP_STR: &'static str = "A state can only be created with v
 			 Therefore creating a SecTrieDB with this state's root will not fail.";
 
 impl<B: Backend> State<B> {
+
+	pub fn get_accesses(&self) -> HashSet<Access> {
+		self.accesses.lock().clone()
+	}
+
+	pub fn clear_accesses(&self) {
+		self.accesses.lock().clear();
+	}
+
 	/// Creates new state with empty state root
 	/// Used for tests.
 	pub fn new(mut db: B, account_start_nonce: U256, factories: Factories) -> State<B> {
@@ -270,6 +290,8 @@ impl<B: Backend> State<B> {
 			checkpoints: RefCell::new(Vec::new()),
 			account_start_nonce,
 			factories,
+			accesses: Default::default(),
+			new_accounts: Default::default(),
 		}
 	}
 
@@ -286,6 +308,8 @@ impl<B: Backend> State<B> {
 			checkpoints: RefCell::new(Vec::new()),
 			account_start_nonce,
 			factories,
+			accesses: Default::default(),
+			new_accounts: Default::default(),
 		};
 
 		Ok(state)
@@ -359,6 +383,9 @@ impl<B: Backend> State<B> {
 		let is_dirty = account.is_dirty();
 		let old_value = self.cache.borrow_mut().insert(*address, account);
 		if is_dirty {
+			// mark account as new
+			self.new_accounts.lock().insert(*address);
+
 			if let Some(ref mut checkpoint) = self.checkpoints.borrow_mut().last_mut() {
 				checkpoint.entry(*address).or_insert(old_value);
 			}
@@ -539,6 +566,11 @@ impl<B: Backend> State<B> {
 		// 2. If there's an entry for the account in the global cache check for the key or load it into that account.
 		// 3. If account is missing in the global cache load it into the local cache and cache the key there.
 
+		self.accesses.lock().insert(Access {
+			target: Target::Storage(*address, *key),
+			mode: AccessMode::Read,
+		});
+
 		{
 			// check local cache first without updating
 			let local_cache = self.cache.borrow_mut();
@@ -584,6 +616,7 @@ impl<B: Backend> State<B> {
 		let db = self.factories.trie.readonly(db, &self.root).expect(SEC_TRIE_DB_UNWRAP_STR);
 		let from_rlp = |b: &[u8]| Account::from_rlp(b).expect("decoding db value failed");
 		let maybe_acc = db.get_with(address.as_bytes(), from_rlp)?;
+
 		let r = maybe_acc.as_ref().map_or(Ok(H256::zero()), |a| {
 			let account_db = self.factories.accountdb.readonly(self.db.as_hash_db(), a.address_hash(address));
 			f_at(a, account_db.as_hash_db(), key)
@@ -709,12 +742,13 @@ impl<B: Backend> State<B> {
 		// first, commit the sub trees.
 		let mut accounts = self.cache.borrow_mut();
 		for (address, ref mut a) in accounts.iter_mut().filter(|&(_, ref a)| a.is_dirty()) {
+
 			if let Some(ref mut account) = a.account {
 				let addr_hash = account.address_hash(address);
 				{
 					let mut account_db = self.factories.accountdb.create(self.db.as_hash_db_mut(), addr_hash);
-					account.commit_storage(&self.factories.trie, account_db.as_hash_db_mut())?;
-					account.commit_code(account_db.as_hash_db_mut());
+					account.commit_storage(&self.factories.trie, account_db.as_hash_db_mut(), self.accesses.clone(), *address)?;
+					account.commit_code(account_db.as_hash_db_mut(), self.accesses.clone(), *address);
 				}
 			}
 		}
@@ -725,10 +759,26 @@ impl<B: Backend> State<B> {
 				a.state = AccountState::Committed;
 				match a.account {
 					Some(ref mut account) => {
+						// ----------------------
 						trie.insert(address.as_bytes(), &account.rlp())?;
+
+						let mode = if self.new_accounts.lock().contains(address) { AccessMode::Create } else { AccessMode::Update };
+
+						self.accesses.lock().insert(Access {
+							target: Target::Account(*address),
+							mode,
+						});
+						// ----------------------
 					},
 					None => {
+						// ----------------------
 						trie.remove(address.as_bytes())?;
+
+						self.accesses.lock().insert(Access {
+							target: Target::Account(*address),
+							mode: AccessMode::Delete,
+						});
+						// ----------------------
 					},
 				};
 			}
@@ -922,10 +972,15 @@ impl<B: Backend> State<B> {
 
 	/// Load required account data from the databases. Returns whether the cache succeeds.
 	#[must_use]
-	fn update_account_cache(require: RequireCache, account: &mut Account, state_db: &B, db: &dyn HashDB<KeccakHasher, DBValue>) -> bool {
+	fn update_account_cache(require: RequireCache, account: &mut Account, state_db: &B, db: &dyn HashDB<KeccakHasher, DBValue>, accesses: Arc<Mutex<HashSet<Access>>>, address: Address) -> bool {
 		if let RequireCache::None = require {
 			return true;
 		}
+
+		accesses.lock().insert(Access {
+			target: Target::Code(address, account.code_hash()),
+			mode: AccessMode::Read,
+		});
 
 		if account.is_cached() {
 			return true;
@@ -962,11 +1017,18 @@ impl<B: Backend> State<B> {
 	/// Populates local cache if nothing found.
 	fn ensure_cached<F, U>(&self, a: &Address, require: RequireCache, f: F) -> TrieResult<U>
 		where F: Fn(Option<&Account>) -> U {
+
+		// TODO: what if only storage is touched?
+		self.accesses.lock().insert(Access {
+			target: Target::Account(*a),
+			mode: AccessMode::Read,
+		});
+
 		// check local cache first
 		if let Some(ref mut maybe_acc) = self.cache.borrow_mut().get_mut(a) {
 			if let Some(ref mut account) = maybe_acc.account {
 				let accountdb = self.factories.accountdb.readonly(self.db.as_hash_db(), account.address_hash(a));
-				if Self::update_account_cache(require, account, &self.db, accountdb.as_hash_db()) {
+				if Self::update_account_cache(require, account, &self.db, accountdb.as_hash_db(), self.accesses.clone(), *a) {
 					return Ok(f(Some(account)));
 				} else {
 					return Err(Box::new(TrieError::IncompleteDatabase(H256::from(*a))));
@@ -978,7 +1040,7 @@ impl<B: Backend> State<B> {
 		let result = self.db.get_cached(a, |mut acc| {
 			if let Some(ref mut account) = acc {
 				let accountdb = self.factories.accountdb.readonly(self.db.as_hash_db(), account.address_hash(a));
-				if !Self::update_account_cache(require, account, &self.db, accountdb.as_hash_db()) {
+				if !Self::update_account_cache(require, account, &self.db, accountdb.as_hash_db(), self.accesses.clone(), *a) {
 					return Err(Box::new(TrieError::IncompleteDatabase(H256::from(*a))));
 				}
 			}
@@ -994,7 +1056,7 @@ impl<B: Backend> State<B> {
 				let mut maybe_acc = db.get_with(a.as_bytes(), from_rlp)?;
 				if let Some(ref mut account) = maybe_acc.as_mut() {
 					let accountdb = self.factories.accountdb.readonly(self.db.as_hash_db(), account.address_hash(a));
-					if !Self::update_account_cache(require, account, &self.db, accountdb.as_hash_db()) {
+					if !Self::update_account_cache(require, account, &self.db, accountdb.as_hash_db(), self.accesses.clone(), *a) {
 						return Err(Box::new(TrieError::IncompleteDatabase(H256::from(*a))));
 					}
 				}
@@ -1015,6 +1077,13 @@ impl<B: Backend> State<B> {
 	pub fn require_or_from<F, G>(&self, a: &Address, require_code: bool, default: F, not_default: G) -> TrieResult<RefMut<Account>>
 		where F: FnOnce() -> Account, G: FnOnce(&mut Account),
 	{
+
+		// TODO: what if only storage is touched?
+		self.accesses.lock().insert(Access {
+			target: Target::Account(*a),
+			mode: AccessMode::Read,
+		});
+
 		let contains_key = self.cache.borrow().contains_key(a);
 		if !contains_key {
 			match self.db.get_cached_account(a) {
@@ -1048,7 +1117,7 @@ impl<B: Backend> State<B> {
 			let addr_hash = account.address_hash(a);
 			let accountdb = self.factories.accountdb.readonly(self.db.as_hash_db(), addr_hash);
 
-			if !Self::update_account_cache(RequireCache::Code, &mut account, &self.db, accountdb.as_hash_db()) {
+			if !Self::update_account_cache(RequireCache::Code, &mut account, &self.db, accountdb.as_hash_db(), self.accesses.clone(), *a) {
 				return Err(Box::new(TrieError::IncompleteDatabase(H256::from(*a))))
 			}
 		}
@@ -1139,6 +1208,7 @@ impl<B: Backend + Clone> Clone for State<B> {
 			cache
 		};
 
+
 		State {
 			db: self.db.clone(),
 			root: self.root.clone(),
@@ -1146,6 +1216,8 @@ impl<B: Backend + Clone> Clone for State<B> {
 			checkpoints: RefCell::new(Vec::new()),
 			account_start_nonce: self.account_start_nonce.clone(),
 			factories: self.factories.clone(),
+			accesses: Arc::new(Mutex::new((*self.accesses.lock()).clone())),
+			new_accounts: Mutex::new((*self.new_accounts.lock()).clone()),
 		}
 	}
 }

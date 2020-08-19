@@ -34,6 +34,10 @@ use ethtrie::{Result as TrieResult, SecTrieDB, TrieDB, TrieFactory};
 use keccak_hasher::KeccakHasher;
 use pod::PodAccount;
 
+use crate::{Target, AccessMode, Access};
+use parking_lot::Mutex;
+use std::collections::HashSet;
+
 const STORAGE_CACHE_ITEMS: usize = 8192;
 
 /// Boolean type for clean/dirty status.
@@ -505,14 +509,34 @@ impl Account {
 	}
 
 	/// Commit the `storage_changes` to the backing DB and update `storage_root`.
-	pub fn commit_storage(&mut self, trie_factory: &TrieFactory, db: &mut dyn HashDB<KeccakHasher, DBValue>) -> TrieResult<()> {
+	pub fn commit_storage(&mut self, trie_factory: &TrieFactory, db: &mut dyn HashDB<KeccakHasher, DBValue>, accesses: Arc<Mutex<HashSet<Access>>>, address: Address) -> TrieResult<()> {
 		let mut t = trie_factory.from_existing(db, &mut self.storage_root)?;
 		for (k, v) in self.storage_changes.drain() {
 			// cast key and value to trait type,
 			// so we can call overloaded `to_bytes` method
 			match v.is_zero() {
-				true => t.remove(k.as_bytes())?,
-				false => t.insert(k.as_bytes(), &encode(&v.into_uint()))?,
+				true => {
+					// ----------------------
+					accesses.lock().insert(Access {
+						target: Target::Storage(address, k),
+						mode: AccessMode::Delete,
+					});
+					// ----------------------
+
+					t.remove(k.as_bytes())?
+				}
+				false => {
+					// ----------------------
+					let mode = if t.contains(k.as_bytes())? { AccessMode::Update } else { AccessMode::Create };
+
+					accesses.lock().insert(Access {
+						target: Target::Storage(address, k),
+						mode,
+					});
+					// ----------------------
+
+					t.insert(k.as_bytes(), &encode(&v.into_uint()))?
+				}
 			};
 
 			self.storage_cache.borrow_mut().insert(k, v);
@@ -522,7 +546,7 @@ impl Account {
 	}
 
 	/// Commit any unsaved code. `code_hash` will always return the hash of the `code_cache` after this.
-	pub fn commit_code(&mut self, db: &mut dyn HashDB<KeccakHasher, DBValue>) {
+	pub fn commit_code(&mut self, db: &mut dyn HashDB<KeccakHasher, DBValue>, accesses: Arc<Mutex<HashSet<Access>>>, address: Address) {
 		trace!("Commiting code of {:?} - {:?}, {:?}", self, self.code_filth == Filth::Dirty, self.code_cache.is_empty());
 		match (self.code_filth == Filth::Dirty, self.code_cache.is_empty()) {
 			(true, true) => {
@@ -530,6 +554,14 @@ impl Account {
 				self.code_filth = Filth::Clean;
 			},
 			(true, false) => {
+				// ----------------------
+				accesses.lock().insert(Access {
+					target: Target::Code(address, self.code_hash),
+					mode: AccessMode::Create,
+				});
+				// ----------------------
+
+				// TODO
 				db.emplace(self.code_hash.clone(), hash_db::EMPTY_PREFIX, self.code_cache.to_vec());
 				self.code_size = Some(self.code_cache.len());
 				self.code_filth = Filth::Clean;

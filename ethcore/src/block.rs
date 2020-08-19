@@ -175,6 +175,13 @@ impl<'x> OpenBlock<'x> {
 		let env_info = self.block.env_info();
 		let outcome = self.block.state.apply(&env_info, self.engine.machine(), &t, self.block.traces.is_enabled())?;
 
+		// ----------------------
+		let number = self.block.header.number();
+		let hash = t.hash();
+		warn!(target: "state", "    <evm-trace> block #{:?}, tx {:?}, accesses = {:?}", number, hash, self.block.state.get_accesses());
+		self.block.state.clear_accesses();
+		// ----------------------
+
 		self.block.transactions_set.insert(t.hash());
 		self.block.transactions.push(t);
 		if let Tracing::Enabled(ref mut traces) = self.block.traces {
@@ -249,6 +256,7 @@ impl<'x> OpenBlock<'x> {
 	pub fn close_and_lock(self) -> Result<LockedBlock, Error> {
 		let mut s = self;
 		s.engine.on_close_block(&mut s.block, &s.parent)?;
+
 		s.block.state.commit()?;
 
 		s.block.header.set_transactions_root(ordered_trie_root(s.block.transactions.iter().map(|e| e.rlp_bytes())));
@@ -450,13 +458,26 @@ pub(crate) fn enact(
 	}
 
 	b.populate_from(header);
+
+	// ----------------------
+	let number = header.number();
+	warn!(target: "state", "<evm-trace> Start execution of block #{:?}", number);
+	// ----------------------
+
 	b.push_transactions(transactions)?;
 
 	for u in uncles {
 		b.push_uncle(u)?;
 	}
 
-	b.close_and_lock()
+	let res = b.close_and_lock();
+
+	// ----------------------
+	let hash = res.as_ref().map(|b| b.clone().block.header.compute_hash()).unwrap_or_default();
+	warn!(target: "state", "<evm-trace> Finish execution of block #{:?}. hash = {:?}", number, hash);
+	// ----------------------
+
+	res
 }
 
 #[cfg(test)]
