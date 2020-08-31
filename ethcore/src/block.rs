@@ -114,7 +114,8 @@ impl<'x> OpenBlock<'x> {
 		is_epoch_begin: bool,
 	) -> Result<Self, Error> {
 		let number = parent.number() + 1;
-		let state = State::from_existing(db, parent.state_root().clone(), engine.account_start_nonce(number), factories)?;
+		let mut state = State::from_existing(db, parent.state_root().clone(), engine.account_start_nonce(number), factories)?;
+		state.set_miner(author.clone());
 		let mut r = OpenBlock { block: ExecutedBlock::new(state, last_hashes, tracing), engine, parent: parent.clone()};
 
 		r.block.header.set_parent_hash(parent.hash());
@@ -175,12 +176,12 @@ impl<'x> OpenBlock<'x> {
 		let env_info = self.block.env_info();
 		let outcome = self.block.state.apply(&env_info, self.engine.machine(), &t, self.block.traces.is_enabled())?;
 
-		// ----------------------
+
 		let number = self.block.header.number();
 		let hash = t.hash();
-		warn!(target: "state", "    <evm-trace> block #{:?}, tx {:?}, accesses = {:?}", number, hash, self.block.state.get_accesses());
+		warn!(target: "state", "<evm-trace> block #{:?}, tx {:?}, accesses = {:?}", number, hash, self.block.state.get_accesses());
 		self.block.state.clear_accesses();
-		// ----------------------
+
 
 		self.block.transactions_set.insert(t.hash());
 		self.block.transactions.push(t);
@@ -256,7 +257,6 @@ impl<'x> OpenBlock<'x> {
 	pub fn close_and_lock(self) -> Result<LockedBlock, Error> {
 		let mut s = self;
 		s.engine.on_close_block(&mut s.block, &s.parent)?;
-
 		s.block.state.commit()?;
 
 		s.block.header.set_transactions_root(ordered_trie_root(s.block.transactions.iter().map(|e| e.rlp_bytes())));
@@ -459,10 +459,8 @@ pub(crate) fn enact(
 
 	b.populate_from(header);
 
-	// ----------------------
 	let number = header.number();
 	warn!(target: "state", "<evm-trace> Start execution of block #{:?}", number);
-	// ----------------------
 
 	b.push_transactions(transactions)?;
 
@@ -472,10 +470,8 @@ pub(crate) fn enact(
 
 	let res = b.close_and_lock();
 
-	// ----------------------
 	let hash = res.as_ref().map(|b| b.clone().block.header.compute_hash()).unwrap_or_default();
 	warn!(target: "state", "<evm-trace> Finish execution of block #{:?}. hash = {:?}", number, hash);
-	// ----------------------
 
 	res
 }

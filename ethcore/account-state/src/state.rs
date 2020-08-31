@@ -212,13 +212,20 @@ pub struct State<B> {
 	account_start_nonce: U256,
 	factories: Factories,
 
-	// track CRUD access to accounts, code, and storage
-	// reads are populated on each db/cache access
-	// writes are populated during commit
+	// track R/W accesses to account balances and storage.
+	// reads are populated on each db/cache access.
+	// writes are populated during commit.
 	accesses: Arc<Mutex<HashSet<Access>>>,
 
-	// track newly created accounts
+	// track newly created accounts.
 	new_accounts: Mutex<HashSet<Address>>,
+
+	// track balances of killed accounts.
+	killed_account_balances: Mutex<HashMap<Address, Option<U256>>>,
+
+	// track normal transfers to the miner.
+	miner_address: Option<Address>,
+	transfer_to_miner: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -292,6 +299,9 @@ impl<B: Backend> State<B> {
 			factories,
 			accesses: Default::default(),
 			new_accounts: Default::default(),
+			killed_account_balances: Default::default(),
+			miner_address: None,
+			transfer_to_miner: false,
 		}
 	}
 
@@ -310,9 +320,16 @@ impl<B: Backend> State<B> {
 			factories,
 			accesses: Default::default(),
 			new_accounts: Default::default(),
+			killed_account_balances: Default::default(),
+			miner_address: None,
+			transfer_to_miner: false,
 		};
 
 		Ok(state)
+	}
+
+	pub fn set_miner(&mut self, miner: Address) {
+		self.miner_address = Some(miner);
 	}
 
 	/// Get a VM factory that can execute on this state.
@@ -431,6 +448,12 @@ impl<B: Backend> State<B> {
 
 	/// Remove an existing account.
 	pub fn kill_account(&mut self, account: &Address) {
+		// remember balance before deletion
+		// self.killed_account_balances.lock().insert(
+		// 	*account,
+		// 	self.cache.get_mut().get(account).expect("Account to be deleted should exist in cache").old_balance,
+		// );
+
 		self.insert_cache(account, AccountEntry::new_dirty(None));
 	}
 
@@ -454,6 +477,12 @@ impl<B: Backend> State<B> {
 
 	/// Get the balance of account `a`.
 	pub fn balance(&self, a: &Address) -> TrieResult<U256> {
+		// Read Balance
+		self.accesses.lock().insert(Access {
+			target: Target::Balance(*a),
+			mode: AccessMode::Read,
+		});
+
 		self.ensure_cached(a, RequireCache::None,
 		|a| a.as_ref().map_or(U256::zero(), |account| *account.balance()))
 	}
@@ -483,7 +512,6 @@ impl<B: Backend> State<B> {
 		|a| a.as_ref().map(|account| account.original_storage_root()))?
 			.unwrap_or(KECCAK_NULL_RLP))
 	}
-
 
 	/// Get the value of storage at a specific checkpoint.
 	pub fn checkpoint_storage_at(&self, start_checkpoint_index: usize, address: &Address, key: &H256) -> TrieResult<Option<H256>> {
@@ -566,6 +594,7 @@ impl<B: Backend> State<B> {
 		// 2. If there's an entry for the account in the global cache check for the key or load it into that account.
 		// 3. If account is missing in the global cache load it into the local cache and cache the key there.
 
+		// Read Storage
 		self.accesses.lock().insert(Access {
 			target: Target::Storage(*address, *key),
 			mode: AccessMode::Read,
@@ -671,6 +700,35 @@ impl<B: Backend> State<B> {
 
 	/// Add `incr` to the balance of account `a`.
 	pub fn add_balance(&mut self, a: &Address, incr: &U256, cleanup_mode: CleanupMode) -> TrieResult<()> {
+		// if miner received explicit transfer,
+		// we will keep it in the tx's write set
+		if Some(*a) == self.miner_address {
+			self.transfer_to_miner = true;
+		}
+
+		// Read Balance
+		self.accesses.lock().insert(Access {
+			target: Target::Balance(*a),
+			mode: AccessMode::Read,
+		});
+
+		trace!(target: "state", "add_balance({}, {}): {}", a, incr, self.balance(a)?);
+		let is_value_transfer = !incr.is_zero();
+		if is_value_transfer || (cleanup_mode == CleanupMode::ForceCreate && !self.exists(a)?) {
+			self.require(a, false)?.add_balance(incr);
+		} else if let CleanupMode::TrackTouched(set) = cleanup_mode {
+			if self.exists(a)? {
+				set.insert(*a);
+				self.touch(a)?;
+			}
+		}
+		Ok(())
+	}
+
+	pub fn add_balance_to_miner(&mut self, a: &Address, incr: &U256, cleanup_mode: CleanupMode) -> TrieResult<()> {
+		// this method is used to distribute mining rewards
+		// so we do not track this
+
 		trace!(target: "state", "add_balance({}, {}): {}", a, incr, self.balance(a)?);
 		let is_value_transfer = !incr.is_zero();
 		if is_value_transfer || (cleanup_mode == CleanupMode::ForceCreate && !self.exists(a)?) {
@@ -686,6 +744,12 @@ impl<B: Backend> State<B> {
 
 	/// Subtract `decr` from the balance of account `a`.
 	pub fn sub_balance(&mut self, a: &Address, decr: &U256, cleanup_mode: &mut CleanupMode) -> TrieResult<()> {
+		// Read Balance
+		self.accesses.lock().insert(Access {
+			target: Target::Balance(*a),
+			mode: AccessMode::Read,
+		});
+
 		trace!(target: "state", "sub_balance({}, {}): {}", a, decr, self.balance(a)?);
 		if !decr.is_zero() || !self.exists(a)? {
 			self.require(a, false)?.sub_balance(decr);
@@ -742,7 +806,6 @@ impl<B: Backend> State<B> {
 		// first, commit the sub trees.
 		let mut accounts = self.cache.borrow_mut();
 		for (address, ref mut a) in accounts.iter_mut().filter(|&(_, ref a)| a.is_dirty()) {
-
 			if let Some(ref mut account) = a.account {
 				let addr_hash = account.address_hash(address);
 				{
@@ -759,29 +822,58 @@ impl<B: Backend> State<B> {
 				a.state = AccountState::Committed;
 				match a.account {
 					Some(ref mut account) => {
-						// ----------------------
 						trie.insert(address.as_bytes(), &account.rlp())?;
 
-						let mode = if self.new_accounts.lock().contains(address) { AccessMode::Create } else { AccessMode::Update };
-
-						self.accesses.lock().insert(Access {
-							target: Target::Account(*address),
-							mode,
-						});
-						// ----------------------
+						if self.new_accounts.lock().contains(address) {
+							// Write Balance
+							// initialize new account with balance
+							// (i.e. payable constructor)
+							if *account.balance() > U256::from(0) {
+								self.accesses.lock().insert(Access {
+									target: Target::Balance(*address),
+									mode: AccessMode::Write,
+								});
+							}
+						}
+						else if a.old_balance != Some(*account.balance()) {
+							// Write Balance
+							// update old account's balance
+							self.accesses.lock().insert(Access {
+								target: Target::Balance(*address),
+								mode: AccessMode::Write,
+							});
+						}
 					},
 					None => {
-						// ----------------------
 						trie.remove(address.as_bytes())?;
 
-						self.accesses.lock().insert(Access {
-							target: Target::Account(*address),
-							mode: AccessMode::Delete,
-						});
-						// ----------------------
+						// let old_balance = self
+						// 	.killed_account_balances
+						// 	.lock()
+						// 	.get(address)
+						// 	.expect("Deleted accounts should be stored")
+						// 	.clone()
+						// 	.unwrap_or(U256::from(0));
+
+						// if old_balance > U256::from(0) {
+						// 	// Write Balance
+						// 	// update account balance
+						// 	self.accesses.lock().insert(Access {
+						// 		target: Target::Balance(*address),
+						// 		mode: AccessMode::Write,
+						// 	});
+						// }
 					},
 				};
 			}
+		}
+
+		// remove miner address
+		if !self.transfer_to_miner && self.miner_address.is_some() {
+			self.accesses.lock().remove(&Access {
+				target: Target::Balance(self.miner_address.expect("Miner address should be set")),
+				mode: AccessMode::Write,
+			});
 		}
 
 		Ok(())
@@ -972,15 +1064,10 @@ impl<B: Backend> State<B> {
 
 	/// Load required account data from the databases. Returns whether the cache succeeds.
 	#[must_use]
-	fn update_account_cache(require: RequireCache, account: &mut Account, state_db: &B, db: &dyn HashDB<KeccakHasher, DBValue>, accesses: Arc<Mutex<HashSet<Access>>>, address: Address) -> bool {
+	fn update_account_cache(require: RequireCache, account: &mut Account, state_db: &B, db: &dyn HashDB<KeccakHasher, DBValue>, _accesses: Arc<Mutex<HashSet<Access>>>, _address: Address) -> bool {
 		if let RequireCache::None = require {
 			return true;
 		}
-
-		accesses.lock().insert(Access {
-			target: Target::Code(address, account.code_hash()),
-			mode: AccessMode::Read,
-		});
 
 		if account.is_cached() {
 			return true;
@@ -1017,13 +1104,6 @@ impl<B: Backend> State<B> {
 	/// Populates local cache if nothing found.
 	fn ensure_cached<F, U>(&self, a: &Address, require: RequireCache, f: F) -> TrieResult<U>
 		where F: Fn(Option<&Account>) -> U {
-
-		// TODO: what if only storage is touched?
-		self.accesses.lock().insert(Access {
-			target: Target::Account(*a),
-			mode: AccessMode::Read,
-		});
-
 		// check local cache first
 		if let Some(ref mut maybe_acc) = self.cache.borrow_mut().get_mut(a) {
 			if let Some(ref mut account) = maybe_acc.account {
@@ -1077,13 +1157,6 @@ impl<B: Backend> State<B> {
 	pub fn require_or_from<F, G>(&self, a: &Address, require_code: bool, default: F, not_default: G) -> TrieResult<RefMut<Account>>
 		where F: FnOnce() -> Account, G: FnOnce(&mut Account),
 	{
-
-		// TODO: what if only storage is touched?
-		self.accesses.lock().insert(Access {
-			target: Target::Account(*a),
-			mode: AccessMode::Read,
-		});
-
 		let contains_key = self.cache.borrow().contains_key(a);
 		if !contains_key {
 			match self.db.get_cached_account(a) {
@@ -1218,6 +1291,9 @@ impl<B: Backend + Clone> Clone for State<B> {
 			factories: self.factories.clone(),
 			accesses: Arc::new(Mutex::new((*self.accesses.lock()).clone())),
 			new_accounts: Mutex::new((*self.new_accounts.lock()).clone()),
+			killed_account_balances: Mutex::new((*self.killed_account_balances.lock()).clone()),
+			miner_address: self.miner_address.clone(),
+			transfer_to_miner: self.transfer_to_miner,
 		}
 	}
 }

@@ -28,25 +28,43 @@ pub mod state;
 
 use ethereum_types::{Address, H256};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub enum Target {
-	Account(Address),
-	Code(Address, H256),
+	Balance(Address),
+	// Account(Address),
+	// CodeHash(Address),
 	Storage(Address, H256),
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub enum AccessMode {
-	Create,
+	// Create,
 	Read,
-	Update,
-	Delete
+	// Update,
+	// Delete,
+	Write,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct Access {
 	target: Target,
 	mode: AccessMode,
+}
+
+impl std::fmt::Debug for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self.mode {
+			AccessMode::Read => f.write_str("R")?,
+			AccessMode::Write => f.write_str("W")?,
+		}
+
+		match self.target {
+			Target::Balance(addr) => f.write_fmt(format_args!("B({:?})", addr))?,
+			Target::Storage(addr, entry) => f.write_fmt(format_args!("S({:?}; {:?})", addr, entry))?,
+		}
+
+		Ok(())
+    }
 }
 
 pub use {

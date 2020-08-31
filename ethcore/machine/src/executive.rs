@@ -1192,7 +1192,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 		// Below: NoEmpty is safe since the sender must already be non-null to have sent this transaction
 		self.state.add_balance(&sender, &refund_value, CleanupMode::NoEmpty)?;
 		trace!(target: "executive", "exec::finalize: Compensating author: fees_value={}, author={}\n", fees_value, &self.info.author);
-		self.state.add_balance(&self.info.author, &fees_value, cleanup_mode(&mut substate, &schedule))?;
+		self.state.add_balance_to_miner(&self.info.author, &fees_value, cleanup_mode(&mut substate, &schedule))?;
 
 		// perform suicides
 		for address in &substate.suicides {

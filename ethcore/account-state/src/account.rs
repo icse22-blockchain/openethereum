@@ -516,24 +516,20 @@ impl Account {
 			// so we can call overloaded `to_bytes` method
 			match v.is_zero() {
 				true => {
-					// ----------------------
+					// Write Storage
 					accesses.lock().insert(Access {
 						target: Target::Storage(address, k),
-						mode: AccessMode::Delete,
+						mode: AccessMode::Write,
 					});
-					// ----------------------
 
 					t.remove(k.as_bytes())?
 				}
 				false => {
-					// ----------------------
-					let mode = if t.contains(k.as_bytes())? { AccessMode::Update } else { AccessMode::Create };
-
+					// Write Storage
 					accesses.lock().insert(Access {
 						target: Target::Storage(address, k),
-						mode,
+						mode: AccessMode::Write,
 					});
-					// ----------------------
 
 					t.insert(k.as_bytes(), &encode(&v.into_uint()))?
 				}
@@ -546,7 +542,7 @@ impl Account {
 	}
 
 	/// Commit any unsaved code. `code_hash` will always return the hash of the `code_cache` after this.
-	pub fn commit_code(&mut self, db: &mut dyn HashDB<KeccakHasher, DBValue>, accesses: Arc<Mutex<HashSet<Access>>>, address: Address) {
+	pub fn commit_code(&mut self, db: &mut dyn HashDB<KeccakHasher, DBValue>, _accesses: Arc<Mutex<HashSet<Access>>>, _address: Address) {
 		trace!("Commiting code of {:?} - {:?}, {:?}", self, self.code_filth == Filth::Dirty, self.code_cache.is_empty());
 		match (self.code_filth == Filth::Dirty, self.code_cache.is_empty()) {
 			(true, true) => {
@@ -554,14 +550,6 @@ impl Account {
 				self.code_filth = Filth::Clean;
 			},
 			(true, false) => {
-				// ----------------------
-				accesses.lock().insert(Access {
-					target: Target::Code(address, self.code_hash),
-					mode: AccessMode::Create,
-				});
-				// ----------------------
-
-				// TODO
 				db.emplace(self.code_hash.clone(), hash_db::EMPTY_PREFIX, self.code_cache.to_vec());
 				self.code_size = Some(self.code_cache.len());
 				self.code_filth = Filth::Clean;
