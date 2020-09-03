@@ -57,6 +57,19 @@ use types::{
 use executive_state::ExecutiveState;
 use machine::ExecutedBlock;
 
+lazy_static! {
+    static ref TRACES_DB: rocksdb::DB = {
+		let path = "_test_db";
+		let prefix_extractor = rocksdb::SliceTransform::create_fixed_prefix(8);
+
+		let mut opts = rocksdb::Options::default();
+		opts.create_if_missing(true);
+		opts.set_prefix_extractor(prefix_extractor);
+
+		rocksdb::DB::open(&opts, path).expect("can open db")
+	};
+}
+
 /// Block that is ready for transactions to be added.
 ///
 /// It's a bit like a Vec<Transaction>, except that whenever a transaction is pushed, we execute it and
@@ -176,12 +189,16 @@ impl<'x> OpenBlock<'x> {
 		let env_info = self.block.env_info();
 		let outcome = self.block.state.apply(&env_info, self.engine.machine(), &t, self.block.traces.is_enabled())?;
 
-
+		// -----------------------------------
 		let number = self.block.header.number();
 		let hash = t.hash();
-		warn!(target: "state", "<evm-trace> block #{:?}, tx {:?}, accesses = {:?}", number, hash, self.block.state.get_accesses());
-		self.block.state.clear_accesses();
 
+		let key = format!("{:0>8}-{:?}", number, hash);
+		let value = format!("{:?}", self.block.state.get_accesses());
+		TRACES_DB.put(key.as_bytes(), value.as_bytes()).expect("write succeeds");
+
+		self.block.state.clear_accesses();
+		// -----------------------------------
 
 		self.block.transactions_set.insert(t.hash());
 		self.block.transactions.push(t);
@@ -472,6 +489,10 @@ pub(crate) fn enact(
 
 	let hash = res.as_ref().map(|b| b.clone().block.header.compute_hash()).unwrap_or_default();
 	warn!(target: "state", "<evm-trace> Finish execution of block #{:?}. hash = {:?}", number, hash);
+
+	// -----------------------------------
+	TRACES_DB.put(b"latest", number.to_string().as_bytes()).expect("write succeeds");
+	// -----------------------------------
 
 	res
 }

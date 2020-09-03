@@ -78,7 +78,7 @@ extern crate ethjson;
 extern crate kvdb_memorydb;
 #[cfg(any(test, feature = "kvdb-rocksdb"))]
 extern crate kvdb_rocksdb;
-#[cfg(feature = "json-tests")]
+// #[cfg(feature = "json-tests")]
 #[macro_use]
 extern crate lazy_static;
 #[cfg(any(test, feature = "test-helpers"))]
