@@ -477,7 +477,7 @@ pub(crate) fn enact(
 	b.populate_from(header);
 
 	let number = header.number();
-	warn!(target: "state", "<evm-trace> Start execution of block #{:?}", number);
+	// warn!(target: "state", "<evm-trace> Start execution of block #{:?}", number);
 
 	b.push_transactions(transactions)?;
 
@@ -487,8 +487,10 @@ pub(crate) fn enact(
 
 	let res = b.close_and_lock();
 
-	let hash = res.as_ref().map(|b| b.clone().block.header.compute_hash()).unwrap_or_default();
-	warn!(target: "state", "<evm-trace> Finish execution of block #{:?}. hash = {:?}", number, hash);
+	if number % 10000 == 0 {
+		let hash = res.as_ref().map(|b| b.clone().block.header.compute_hash()).unwrap_or_default();
+		warn!(target: "state", "<evm-trace> Finish execution of block #{:?}. hash = {:?}", number, hash);
+	}
 
 	// -----------------------------------
 	TRACES_DB.put(b"latest", number.to_string().as_bytes()).expect("write succeeds");
