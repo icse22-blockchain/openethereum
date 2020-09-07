@@ -277,8 +277,11 @@ impl<B: Backend> State<B> {
 		self.accesses.lock().clone()
 	}
 
-	pub fn clear_accesses(&self) {
+	pub fn clear_accesses(&mut self) {
 		self.accesses.lock().clear();
+		self.new_accounts.lock().clear();
+		self.killed_account_balances.lock().clear();
+		self.transfer_to_miner = false;
 	}
 
 	/// Creates new state with empty state root
